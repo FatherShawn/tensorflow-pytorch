@@ -1,13 +1,28 @@
 import typing
 import torch
 import torch.nn as nn
+import torch.nn.functional as activation
 import itertools
 
-# This model uses 224 x 224 color images.
+# This model uses 256 x 256 color images.
+
+##################################################################################
+# The Idomatic architecture pattern is three-fold:
+#
+# Stem: This is the entry point.  It does course feature extraction and
+#       adjusts the shape of the data for the Learner component.
+# Learner: This is where the convolutions are for learning the features
+#          of the images.
+# Classifier: Maps the features to one or more image categories. Ex: dog, cat
+#
+# This pattern is coded below with a class for each stage of the architecture.
+# The ResNet itself then is a simple object composed of an instance of each
+# stage.
+##################################################################################
 
 class ResStem(nn.Module):
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Call the parent constructor.
         super().__init__()
 
@@ -17,7 +32,7 @@ class ResStem(nn.Module):
             nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=3, stride=2)
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
 
     def forward(self, inputs):
@@ -28,13 +43,13 @@ class ResGroup(typing.TypedDict):
     """
     A data structure for the Residual Groups.
     """
-    n_filters: int
     projection_block: nn.Sequential
+    shortcut: nn.Sequential
     identity_blocks: tuple[nn.Sequential, ...]
 
 class ResLearner(nn.Module):
 
-    def __init__(self, group_parameters: list[tuple[int, int], ...]):
+    def __init__(self, group_parameters: list[tuple[int, int], ...], incoming_filters: int = 64) -> None:
         """
         Parameters
         ----------
@@ -45,15 +60,19 @@ class ResLearner(nn.Module):
             ResNet50:  [ (64, 3), (128, 4), (256, 6),  (512, 3) ]
             ResNet101: [ (64, 3), (128, 4), (256, 23), (512, 3) ]
             ResNet152: [ (64, 3), (128, 8), (256, 36), (512, 3) ]
+        incoming_filters: int
+          The number of filters set in the output of the Stem component. Typically set to 64.
         """
         # Call the parent constructor.
         super().__init__()
 
+        # Track the number of output channels in the prior block for use as input channels in the next block.
+        self.__trailing_filters = incoming_filters
         # Define the groups.
         self.__groups: list[ResGroup] = []
 
         # First Residual Block Group (not strided)
-        n_filters, n_blocks = group_parameters.popleft()
+        n_filters, n_blocks = group_parameters.pop(0)
         self.__groups.append(self.__build_group(n_filters, n_blocks, 1))
 
         # Remaining Residual Block Groups (strided with default of 2)
@@ -80,7 +99,7 @@ class ResLearner(nn.Module):
         x = self.__forward_group(x, group, 1)
 
         # Now feed through the remaining groups.
-        for group in itertools.islice(self.__groups, 1):
+        for group in itertools.islice(self.__groups, 1, None):
             x = self.__forward_group(x, group)
 
         return x
@@ -102,9 +121,13 @@ class ResLearner(nn.Module):
         torch.Tensor
           The output from the layers in the group.
         """
-        x = group['projection_block'](x) + self.__add_projection_shortcut(x, group['n_filters'], stride)
+        shortcut = group['shortcut'](x)
+        x = group['projection_block'](x)
+        x = x + shortcut
         for block in group['identity_blocks']:
+            shortcut = x
             x = block(x)
+            x = x + shortcut
         return x
 
     def __build_group(self, n_filters, n_blocks, strides=2) -> ResGroup:
@@ -125,12 +148,14 @@ class ResLearner(nn.Module):
         -------
         ResGroup
         """
+        shortcut = self.__get_projection_shortcut(n_filters, strides)
+        projection = self.__projection_residual_block(n_filters, strides)
         identities = []
         for _ in range(n_blocks):
             identities.append(self.__standard_residual_block(n_filters))
         return ResGroup(
-            n_filters=n_filters,
-            projection_block=self.__projection_residual_block(n_filters, strides),
+            projection_block=projection,
+            shortcut=shortcut,
             identity_blocks=tuple(identities)
         )
 
@@ -155,21 +180,22 @@ class ResLearner(nn.Module):
 
         # Dimensionality reduction
         layers += [
-            nn.BatchNorm2d(n_filters),
+            nn.BatchNorm2d(self.__trailing_filters),
             nn.ReLU(),
-            nn.Conv2d(3, n_filters, kernel_size=(1, 1), stride=(1, 1))
+            nn.Conv2d(self.__trailing_filters, n_filters, kernel_size=(1, 1), stride=(1, 1))
         ]
         # Bottleneck layer
         layers += [
             nn.BatchNorm2d(n_filters),
             nn.ReLU(),
-            nn.Conv2d(3, n_filters, kernel_size=(3, 3), stride=(1, 1))
+            nn.Conv2d(n_filters, n_filters, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), padding_mode='replicate')
         ]
         # Dimensionality restoration - increase the number of filters by 4X
+        self.__trailing_filters = 4 * n_filters
         layers += [
             nn.BatchNorm2d(n_filters),
             nn.ReLU(),
-            nn.Conv2d(3, 4 * n_filters, kernel_size=(1, 1), stride=(1, 1))
+            nn.Conv2d(n_filters, self.__trailing_filters, kernel_size=(1, 1), stride=(1, 1))
         ]
         return nn.Sequential(*layers)
 
@@ -207,26 +233,27 @@ class ResLearner(nn.Module):
 
         # Dimensionality reduction
         layers += [
-            nn.BatchNorm2d(n_filters),
+            nn.BatchNorm2d(self.__trailing_filters),
             nn.ReLU(),
-            nn.Conv2d(3, n_filters, kernel_size=(1, 1), stride=(1, 1))
+            nn.Conv2d(self.__trailing_filters, n_filters, kernel_size=(1, 1), stride=(1, 1))
         ]
         # Bottleneck layer
         # Feature pooling when strides=(2, 2)
         layers += [
             nn.BatchNorm2d(n_filters),
             nn.ReLU(),
-            nn.Conv2d(3, n_filters, kernel_size=(3, 3), stride=(strides, strides), padding=(1, 1), padding_mode='replicate')
+            nn.Conv2d(n_filters, n_filters, kernel_size=(3, 3), stride=(strides, strides), padding=(1, 1), padding_mode='replicate')
         ]
         # Dimensionality restoration - increase the number of filters by 4X
+        self.__trailing_filters = 4 * n_filters
         layers += [
             nn.BatchNorm2d(n_filters),
             nn.ReLU(),
-            nn.Conv2d(3, 4 * n_filters, kernel_size=(1, 1), stride=(1, 1))
+            nn.Conv2d(n_filters, self.__trailing_filters, kernel_size=(1, 1), stride=(1, 1))
         ]
         return nn.Sequential(*layers)
 
-    def __add_projection_shortcut(self, inputs: torch.Tensor, n_filters: int, strides: int = 2) -> torch.Tensor:
+    def __get_projection_shortcut(self, n_filters: int, strides: int = 2) -> nn.Sequential:
         """
         Process a projection shortcut.
 
@@ -242,13 +269,52 @@ class ResLearner(nn.Module):
 
         Returns
         -------
-        torch.Tensor
-            The layers for a Sequential model
+        nn.Sequential
+            The Sequential model for a shortcut block.
         """
-        # Increase filters by 4X to match shape when added to output of block
-        model = nn.Sequential(
-            nn.BatchNorm2d(n_filters),
-            nn.Conv2d(3, 4 * n_filters, kernel_size=(1, 1), stride=(strides, strides)),
+        return nn.Sequential(
+            # Channels entering the projection block will be self.__trailing_filters.
+            # Channels exiting the projection block will be 4 * n_filters so match the shape.
+            nn.BatchNorm2d(self.__trailing_filters),
+            nn.Conv2d(self.__trailing_filters, 4 * n_filters, kernel_size=(1, 1), stride=(strides, strides)),
         )
-        shortcut = model(inputs)
-        return inputs + shortcut
+
+class ResClassifier(nn.Module):
+
+    def __init__(self, n_filters: int, n_classes: int) -> None:
+        """
+        Constructor for the ResClassifier.
+
+        Parameters
+        ----------
+        n_filters: int
+            The number of incoming filters.  4 * the final n_filters for the learner blocks if paired with ResLearner.
+        n_classes: int
+            The number of classes into which images are sorted.
+        """
+        # Call the parent constructor.
+        super().__init__()
+
+        self.denseLayer = nn.Linear(n_filters, n_classes)
+        self.globalAveragePool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.globalAveragePool(x)
+        # Flatten for the dense layer
+        x = torch.flatten(x, 1)
+        return activation.softmax(self.denseLayer(x))
+
+class ResNet(nn.Module):
+
+    def __init__(self, stem: ResStem, learner: ResLearner, classifier: ResClassifier) -> None:
+        # Call the parent constructor.
+        super().__init__()
+
+        self.stem = stem
+        self.learner = learner
+        self.classifier = classifier
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.learner(x)
+        return self.classifier(x)
